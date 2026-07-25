@@ -80,7 +80,10 @@ class NavBridgeService : AccessibilityService() {
         val distance = texts
             .mapNotNull { distanceRegex.find(it) }
             .minByOrNull { toMeters(it.groupValues[1], it.groupValues[2]) }
-            ?.value ?: lastDistance
+            ?.value
+            ?.replace('\u00A0', ' ')          // Google Maps uses NBSP between number and unit
+            ?.filter { it.code in 32..126 }   // strip anything else non-ASCII, just in case
+            ?: lastDistance
 
         // ── ETA: looks like "2:45 PM" or "12 min" ──
         val etaRegex = Regex("""(\d{1,2}:\d{2}\s*(AM|PM)|\d+\s*min)""", RegexOption.IGNORE_CASE)
@@ -103,6 +106,22 @@ class NavBridgeService : AccessibilityService() {
         lastEta       = eta
 
         Log.d(TAG, "Nav update → dir=$direction | street=$street | dist=$distance | eta=$eta")
+        fun sanitize(s: String): String = s.replace('\u00A0', ' ').filter { it.code in 32..126 }
+
+        val cleanDirection = sanitize(direction)
+        val cleanStreet    = sanitize(street)
+        val cleanDistance  = sanitize(distance)
+        val cleanEta       = sanitize(eta)
+
+        if (cleanDirection == lastDirection && cleanStreet == lastStreet &&
+            cleanDistance == lastDistance  && cleanEta == lastEta) return
+
+        lastDirection = cleanDirection
+        lastStreet    = cleanStreet
+        lastDistance  = cleanDistance
+        lastEta       = cleanEta
+
+        onNavUpdate?.invoke(cleanDirection, cleanStreet, cleanDistance, cleanEta)
         onNavUpdate?.invoke(direction, street, distance, eta)
     }
 
