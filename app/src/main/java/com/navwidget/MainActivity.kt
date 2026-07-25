@@ -37,6 +37,11 @@ class MainActivity : AppCompatActivity() {
     private val handler = Handler(Looper.getMainLooper())
     private var scanning = false
 
+    // ── Write queue (serializes GATT writes — Android BLE only allows one
+    //    outstanding write at a time; overlapping writes cause corruption) ──
+    private val writeQueue = ArrayDeque<Pair<BluetoothGattCharacteristic, ByteArray>>()
+    private var writeInFlight = false
+
     // ── UI ─────────────────────────────────────────────────────────────────
     private lateinit var btnScan:          Button
     private lateinit var btnAccessibility: Button
@@ -72,6 +77,8 @@ class MainActivity : AppCompatActivity() {
                     charStreet    = null
                     charDistance  = null
                     charEta       = null
+                    writeQueue.clear()
+                    writeInFlight = false
                     runOnUiThread {
                         tvStatus.text = "Disconnected — tap Scan to reconnect"
                         btnScan.isEnabled = true
@@ -95,6 +102,16 @@ class MainActivity : AppCompatActivity() {
                 tvStatus.text = "Ready — waiting for Maps navigation"
                 btnScan.isEnabled = false
             }
+        }
+
+        // Fires when a write we issued completes — drives the write queue.
+        override fun onCharacteristicWrite(
+            gatt: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic,
+            status: Int
+        ) {
+            writeInFlight = false
+            processWriteQueue()
         }
     }
 
@@ -199,18 +216,30 @@ class MainActivity : AppCompatActivity() {
     }
 
     // ── Send data over BLE ─────────────────────────────────────────────────
-    private fun sendNavToBle(direction: String, street: String, distance: String, eta: String) {
+    // Writes are queued and sent one at a time, waiting for each write to
+    // complete (onCharacteristicWrite) before the next is sent. This
+    // replaces the old fixed-delay approach, which could let two writes
+    // overlap on the wire and corrupt a characteristic's payload.
+    private fun enqueueWrite(char: BluetoothGattCharacteristic?, value: String) {
+        char ?: return
+        writeQueue.addLast(char to value.toByteArray(Charsets.UTF_8))
+        processWriteQueue()
+    }
+
+    private fun processWriteQueue() {
+        if (writeInFlight || writeQueue.isEmpty()) return
         val gatt = bluetoothGatt ?: return
-        fun write(char: BluetoothGattCharacteristic?, value: String) {
-            char ?: return
-            char.value = value.toByteArray(Charsets.UTF_8)
-            gatt.writeCharacteristic(char)
-        }
-        // Write sequentially with small delay to avoid GATT congestion
-        write(charDirection, direction)
-        handler.postDelayed({ write(charStreet,   street)   }, 80)
-        handler.postDelayed({ write(charDistance, distance) }, 160)
-        handler.postDelayed({ write(charEta,      eta)      }, 240)
+        val (char, bytes) = writeQueue.removeFirst()
+        char.value = bytes
+        writeInFlight = true
+        gatt.writeCharacteristic(char)
+    }
+
+    private fun sendNavToBle(direction: String, street: String, distance: String, eta: String) {
+        enqueueWrite(charDirection, direction)
+        enqueueWrite(charStreet,    street)
+        enqueueWrite(charDistance,  distance)
+        enqueueWrite(charEta,       eta)
     }
 
     companion object {
