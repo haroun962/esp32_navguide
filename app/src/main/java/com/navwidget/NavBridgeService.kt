@@ -64,10 +64,23 @@ class NavBridgeService : AccessibilityService() {
 
         if (texts.isEmpty()) return
 
-        // ── Distance: looks like "0.3 mi", "500 ft", "1.2 km" ──
+        // ── Distance: pick the SMALLEST distance-like value on screen.
+        // Google Maps shows both "distance to next turn" and a trip-summary
+        // distance simultaneously — the next-turn value is always the smaller
+        // one, since it's a sub-segment of the full remaining route.
         val distanceRegex = Regex("""(\d+\.?\d*)\s*(mi|ft|km|m)\b""", RegexOption.IGNORE_CASE)
-        val distance = texts.firstOrNull { distanceRegex.containsMatchIn(it) }
-            ?.let { distanceRegex.find(it)?.value } ?: lastDistance
+
+        fun toMeters(value: String, unit: String): Double = when (unit.lowercase()) {
+            "mi" -> value.toDouble() * 1609.34
+            "km" -> value.toDouble() * 1000.0
+            "ft" -> value.toDouble() * 0.3048
+            else -> value.toDouble() // "m"
+        }
+
+        val distance = texts
+            .mapNotNull { distanceRegex.find(it) }
+            .minByOrNull { toMeters(it.groupValues[1], it.groupValues[2]) }
+            ?.value ?: lastDistance
 
         // ── ETA: looks like "2:45 PM" or "12 min" ──
         val etaRegex = Regex("""(\d{1,2}:\d{2}\s*(AM|PM)|\d+\s*min)""", RegexOption.IGNORE_CASE)
