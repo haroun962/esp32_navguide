@@ -12,24 +12,18 @@ import android.view.accessibility.AccessibilityNodeInfo
  * Reads the active Google Maps navigation notification / on-screen UI
  * and extracts: direction, street name, distance, and ETA.
  *
- * Google Maps keeps the current maneuver info in its notification while
- * navigating.  The accessibility service intercepts window content changes
- * from com.google.android.apps.maps and parses the relevant nodes.
- *
  * Supported direction strings sent to ESP32:
  *   NONE, STRAIGHT, LEFT, RIGHT, SLIGHT_LEFT, SLIGHT_RIGHT, U_TURN, ARRIVE
  */
 class NavBridgeService : AccessibilityService() {
 
     companion object {
-        private const val TAG        = "NavBridgeService"
-        private const val MAPS_PKG   = "com.google.android.apps.maps"
+        private const val TAG      = "NavBridgeService"
+        private const val MAPS_PKG = "com.google.android.apps.maps"
 
-        // Callback set by MainActivity to forward data
         var onNavUpdate: ((direction: String, street: String, distance: String, eta: String) -> Unit)? = null
     }
 
-    // Debounce — only push if something actually changed
     private var lastDirection = ""
     private var lastStreet    = ""
     private var lastDistance  = ""
@@ -56,33 +50,27 @@ class NavBridgeService : AccessibilityService() {
 
     override fun onInterrupt() {}
 
+    // ── Sanitize: normalize NBSP and strip non-ASCII before sending over BLE.
+    // Google Maps uses U+00A0 (non-breaking space) between number and unit —
+    // the ESP32's drawString() renders the raw high byte as a garbled glyph.
+    private fun sanitize(s: String): String =
+        s.replace('\u00A0', ' ').filter { it.code in 32..126 }
+
     // ── Window parser ──────────────────────────────────────────────────────
     private fun parseNavFromWindow(root: AccessibilityNodeInfo) {
-        // Collect all visible text nodes
         val texts = mutableListOf<String>()
         collectTexts(root, texts)
-
         if (texts.isEmpty()) return
 
-        // ── Distance: pick the SMALLEST distance-like value on screen.
+        // ── Distance: match only nodes whose ENTIRE content is a distance.
         // Google Maps shows both "distance to next turn" and a trip-summary
-        // distance simultaneously — the next-turn value is always the smaller
-        // one, since it's a sub-segment of the full remaining route.
-        val distanceRegex = Regex("""(\d+\.?\d*)\s*(mi|ft|km|m)\b""", RegexOption.IGNORE_CASE)
-
-        fun toMeters(value: String, unit: String): Double = when (unit.lowercase()) {
-            "mi" -> value.toDouble() * 1609.34
-            "km" -> value.toDouble() * 1000.0
-            "ft" -> value.toDouble() * 0.3048
-            else -> value.toDouble() // "m"
-        }
-
+        // distance on screen simultaneously. Using ^...$ anchors ensures we
+        // only match the standalone turn-distance node (e.g. "160 m"),
+        // ignoring anything that merely contains a distance in a longer string.
+        val distanceRegex = Regex("""^(\d+\.?\d*)\s*(mi|ft|km|m)$""", RegexOption.IGNORE_CASE)
         val distance = texts
-            .mapNotNull { distanceRegex.find(it) }
-            .minByOrNull { toMeters(it.groupValues[1], it.groupValues[2]) }
-            ?.value
-            ?.replace('\u00A0', ' ')          // Google Maps uses NBSP between number and unit
-            ?.filter { it.code in 32..126 }   // strip anything else non-ASCII, just in case
+            .map { it.replace('\u00A0', ' ').trim() }
+            .firstOrNull { distanceRegex.matches(it) }
             ?: lastDistance
 
         // ── ETA: looks like "2:45 PM" or "12 min" ──
@@ -93,36 +81,26 @@ class NavBridgeService : AccessibilityService() {
         // ── Direction: inferred from maneuver content-description on ImageViews ──
         val direction = inferDirection(root) ?: lastDirection
 
-        // ── Street: the text node after the distance, or the longest non-numeric string ──
+        // ── Street: longest non-numeric, non-distance, non-ETA text node ──
         val street = inferStreet(texts, distance) ?: lastStreet
 
-        // Only update if changed
-        if (direction == lastDirection && street == lastStreet &&
-            distance == lastDistance  && eta == lastEta) return
-
-        lastDirection = direction
-        lastStreet    = street
-        lastDistance  = distance
-        lastEta       = eta
-
-        Log.d(TAG, "Nav update → dir=$direction | street=$street | dist=$distance | eta=$eta")
-        fun sanitize(s: String): String = s.replace('\u00A0', ' ').filter { it.code in 32..126 }
-
+        // Sanitize all fields before comparison and send
         val cleanDirection = sanitize(direction)
         val cleanStreet    = sanitize(street)
         val cleanDistance  = sanitize(distance)
         val cleanEta       = sanitize(eta)
 
+        // Only push if something changed
         if (cleanDirection == lastDirection && cleanStreet == lastStreet &&
-            cleanDistance == lastDistance  && cleanEta == lastEta) return
+            cleanDistance  == lastDistance  && cleanEta   == lastEta) return
 
         lastDirection = cleanDirection
         lastStreet    = cleanStreet
         lastDistance  = cleanDistance
         lastEta       = cleanEta
 
+        Log.d(TAG, "Nav update → dir=$cleanDirection | street=$cleanStreet | dist=$cleanDistance | eta=$cleanEta")
         onNavUpdate?.invoke(cleanDirection, cleanStreet, cleanDistance, cleanEta)
-        onNavUpdate?.invoke(direction, street, distance, eta)
     }
 
     private fun collectTexts(node: AccessibilityNodeInfo, out: MutableList<String>) {
@@ -135,10 +113,6 @@ class NavBridgeService : AccessibilityService() {
         }
     }
 
-    /**
-     * Google Maps renders the maneuver arrow as an ImageView whose
-     * contentDescription contains the maneuver type text.
-     */
     private fun inferDirection(root: AccessibilityNodeInfo): String? {
         val candidates = mutableListOf<String>()
         collectContentDescriptions(root, candidates)
@@ -146,13 +120,13 @@ class NavBridgeService : AccessibilityService() {
         for (cd in candidates) {
             val lower = cd.lowercase()
             return when {
-                "arrive"        in lower || "destination" in lower -> "ARRIVE"
-                "u-turn"        in lower || "u turn"      in lower -> "U_TURN"
-                "slight left"   in lower                           -> "SLIGHT_LEFT"
-                "slight right"  in lower                           -> "SLIGHT_RIGHT"
-                "turn left"     in lower || "left"        in lower -> "LEFT"
-                "turn right"    in lower || "right"       in lower -> "RIGHT"
-                "straight"      in lower || "continue"    in lower -> "STRAIGHT"
+                "arrive"       in lower || "destination" in lower -> "ARRIVE"
+                "u-turn"       in lower || "u turn"      in lower -> "U_TURN"
+                "slight left"  in lower                           -> "SLIGHT_LEFT"
+                "slight right" in lower                           -> "SLIGHT_RIGHT"
+                "turn left"    in lower || "left"        in lower -> "LEFT"
+                "turn right"   in lower || "right"       in lower -> "RIGHT"
+                "straight"     in lower || "continue"    in lower -> "STRAIGHT"
                 else -> continue
             }
         }
@@ -168,7 +142,6 @@ class NavBridgeService : AccessibilityService() {
     }
 
     private fun inferStreet(texts: List<String>, distance: String): String? {
-        // Street names are generally the longest non-numeric, non-ETA text node
         val skip = Regex("""^\d|mi$|ft$|km$|min$|AM$|PM$""", RegexOption.IGNORE_CASE)
         return texts
             .filter { it.length in 3..50 && !skip.containsMatchIn(it) && it != distance }
